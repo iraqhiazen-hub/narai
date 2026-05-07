@@ -12,8 +12,16 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Tracks active nudge tasks per user
+# Tracks nudge tasks, last action, and resistance level per user
 nudge_tasks = {}
+user_last_action = {}
+user_resistance_level = {}
+
+RESISTANCE_WORDS = [
+    "males", "ga mau", "nanti aja", "nanti", "capek",
+    "later", "ga bisa", "susah", "malas", "belum",
+    "ga sanggup", "overwhelmed", "berat"
+]
 
 def detect_intent(message):
     message = message.lower()
@@ -25,6 +33,14 @@ def detect_intent(message):
         return "LOW_ENERGY"
     else:
         return "STUCK"
+
+def is_resistance(message):
+    message = message.lower()
+    return any(word in message for word in RESISTANCE_WORDS)
+
+def is_done(message):
+    message = message.lower()
+    return any(word in message for word in ["done", "sudah", "udah", "selesai", "beres", "oke", "ok", "yes", "ya"])
 
 def ask_narai(user_message, intent):
     system_prompt = """Kamu adalah narAI, teman yang selalu ada buat bantuin user mulai ngerjain sesuatu.
@@ -55,6 +71,30 @@ Yang harus kamu lakuin:
     )
     return response.choices[0].message.content
 
+def ask_narai_simplified(last_action, resistance_level):
+    if resistance_level == 1:
+        prompt = f"""User menolak untuk melakukan ini: {last_action}
+
+Buat versi yang LEBIH KECIL dari tugas itu. 
+Contoh: kalau tugasnya "tulis 3 poin", jadi "tulis 1 poin aja".
+Tetap casual, hangat, 1-2 kalimat, pakai lo/gue."""
+
+    else:
+        prompt = f"""User masih menolak. Tugas sebelumnya: {last_action}
+
+Buat versi yang PALING KECIL mungkin — sekecil "buka aplikasinya aja" atau "ambil laptopnya dulu".
+Tetap casual, hangat, 1-2 kalimat, pakai lo/gue."""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Kamu adalah narAI, teman casual yang bantu user mulai kerja. Selalu pakai bahasa lo/gue yang santai."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=100
+    )
+    return response.choices[0].message.content
+
 async def send_nudge(context, chat_id, nudge_number):
     if nudge_number == 1:
         await context.bot.send_message(
@@ -68,11 +108,8 @@ async def send_nudge(context, chat_id, nudge_number):
         )
 
 async def nudge_sequence(context, chat_id):
-    # Wait 60 minutes then send nudge 1
     await asyncio.sleep(3600)
     await send_nudge(context, chat_id, 1)
-
-    # Wait 2 more hours then send nudge 2
     await asyncio.sleep(7200)
     await send_nudge(context, chat_id, 2)
 
@@ -85,14 +122,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nudge_tasks[chat_id].cancel()
         del nudge_tasks[chat_id]
 
-    intent = detect_intent(user_message)
-    reply = ask_narai(user_message, intent)
-    await update.message.reply_text(reply)
+    # Check if user is done
+    if is_done(user_message) and chat_id in user_last_action:
+        user_resistance_level[chat_id] = 0
+        await update.message.reply_text("Niceee, gue bangga sama lo! 🙌 Mau lanjut ke hal berikutnya?")
+        return
 
-    # Inform user a check-in is coming
-    await update.message.reply_text("Gue bakal check in sama lo sekitar 1 jam lagi ya. Gas! 🔥")
+    # Check if user is resisting
+    if is_resistance(user_message) and chat_id in user_last_action:
+        level = user_resistance_level.get(chat_id, 0) + 1
+        user_resistance_level[chat_id] = min(level, 2)
 
-    # Start nudge sequence
+        simplified = ask_narai_simplified(user_last_action[chat_id], level)
+        user_last_action[chat_id] = simplified
+        await update.message.reply_text(simplified)
+
+    else:
+        # Normal flow
+        user_resistance_level[chat_id] = 0
+        intent = detect_intent(user_message)
+        reply = ask_narai(user_message, intent)
+        user_last_action[chat_id] = reply
+        await update.message.reply_text(reply)
+        await update.message.reply_text("Gue bakal check in sama lo sekitar 1 jam lagi ya. Gas! 🔥")
+
+    # Restart nudge sequence
     task = asyncio.create_task(nudge_sequence(context, chat_id))
     nudge_tasks[chat_id] = task
 
