@@ -17,20 +17,29 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 nudge_tasks = {}
 user_last_action = {}
 user_resistance_level = {}
+user_state = {}
+
+# States
+CLARIFYING = "CLARIFYING"
+ACTION_SENT = "ACTION_SENT"
 
 RESISTANCE_WORDS = [
     "males", "ga mau", "nanti aja", "nanti", "capek",
     "later", "ga bisa", "susah", "malas", "belum",
-    "ga sanggup", "overwhelmed", "berat"
+    "ga sanggup", "berat"
+]
+
+CLARIFYING_PHRASES = [
+    "susun prioritas", "prioritas", "ga tau mau ngerjain apa",
+    "bingung mau ngapain", "harus ngapain", "mulai dari mana",
+    "help me prioritize", "what should i do", "ga tau", "confused"
 ]
 
 def action_buttons():
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Udah done!", callback_data="done"),
-            InlineKeyboardButton("😩 Males ah", callback_data="resist")
-        ]
-    ]
+    keyboard = [[
+        InlineKeyboardButton("✅ Udah done!", callback_data="done"),
+        InlineKeyboardButton("😩 Males ah", callback_data="resist")
+    ]]
     return InlineKeyboardMarkup(keyboard)
 
 def detect_intent(message):
@@ -39,10 +48,14 @@ def detect_intent(message):
         return "STUCK"
     elif any(word in message for word in ["overwhelmed", "too many", "banyak banget", "overwhelm", "banyak tugas"]):
         return "OVERWHELMED"
-    elif any(word in message for word in ["tired", "no energy", "capek", "lelah", "males", "exhausted"]):
+    elif any(word in message for word in ["tired", "no energy", "capek", "lelah", "malas", "exhausted"]):
         return "LOW_ENERGY"
     else:
         return "STUCK"
+
+def is_clarifying(message):
+    message = message.lower()
+    return any(phrase in message for phrase in CLARIFYING_PHRASES)
 
 def is_resistance(message):
     message = message.lower()
@@ -76,6 +89,29 @@ Yang harus kamu lakuin:
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"Intent: {intent}\nMessage: {user_message}"}
+        ],
+        max_tokens=100
+    )
+    return response.choices[0].message.content
+
+def ask_narai_clarify(user_message):
+    prompt = f"""User bilang: "{user_message}"
+
+Mereka belum tau mau ngerjain apa. Tugas lo adalah bantu mereka identify SATU tugas konkret.
+
+Caranya:
+- Tanya satu pertanyaan singkat yang bantu mereka fokus
+- Contoh: "Oke, dari semua yang ada di kepala lo sekarang, tugas apa yang paling bikin lo kepikiran?"
+- Atau: "Kalau lo harus selesaiin satu hal hari ini, apa yang itu?"
+- Maksimal 2 kalimat
+- Casual, pakai lo/gue
+- Jangan kasih action dulu, bantu mereka identify tugasnya"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Kamu adalah narAI, teman casual yang bantu user mulai kerja."},
+            {"role": "user", "content": prompt}
         ],
         max_tokens=100
     )
@@ -185,17 +221,21 @@ def start_nudge(context, chat_id):
     task = asyncio.create_task(nudge_sequence(context, chat_id))
     nudge_tasks[chat_id] = task
 
+def stop_nudge(chat_id):
+    if chat_id in nudge_tasks:
+        nudge_tasks[chat_id].cancel()
+        del nudge_tasks[chat_id]
+
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
 
-    if chat_id in nudge_tasks:
-        nudge_tasks[chat_id].cancel()
-        del nudge_tasks[chat_id]
+    stop_nudge(chat_id)
 
     if query.data == "done":
         user_resistance_level[chat_id] = 0
+        user_state[chat_id] = CLARIFYING
         await query.edit_message_reply_markup(reply_markup=None)
         await context.bot.send_message(
             chat_id=chat_id,
@@ -209,6 +249,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         simplified = ask_narai_simplified(user_last_action.get(chat_id, "tugas lo"), level)
         user_last_action[chat_id] = simplified
+        user_state[chat_id] = ACTION_SENT
 
         await context.bot.send_message(
             chat_id=chat_id,
@@ -220,38 +261,49 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_message = update.message.text
+    current_state = user_state.get(chat_id, CLARIFYING)
 
-    if chat_id in nudge_tasks:
-        nudge_tasks[chat_id].cancel()
-        del nudge_tasks[chat_id]
+    stop_nudge(chat_id)
 
-    if is_done(user_message) and chat_id in user_last_action:
+    # User says done
+    if is_done(user_message) and current_state == ACTION_SENT:
         user_resistance_level[chat_id] = 0
+        user_state[chat_id] = CLARIFYING
         await update.message.reply_text("Niceee, gue bangga sama lo! 🙌 Mau lanjut ke hal berikutnya?")
         return
 
-    if is_resistance(user_message) and chat_id in user_last_action:
+    # User is resisting
+    if is_resistance(user_message) and current_state == ACTION_SENT:
         level = user_resistance_level.get(chat_id, 0) + 1
         user_resistance_level[chat_id] = min(level, 2)
         simplified = ask_narai_simplified(user_last_action[chat_id], level)
         user_last_action[chat_id] = simplified
+        user_state[chat_id] = ACTION_SENT
         await update.message.reply_text(simplified, reply_markup=action_buttons())
-    else:
-        user_resistance_level[chat_id] = 0
-        intent = detect_intent(user_message)
-        reply = ask_narai(user_message, intent)
-        user_last_action[chat_id] = reply
-        await update.message.reply_text(reply, reply_markup=action_buttons())
-        await update.message.reply_text("Gue bakal check in sama lo sekitar 1 jam lagi ya. Gas! 🔥")
+        start_nudge(context, chat_id)
+        return
 
+    # User is still figuring out what to do
+    if is_clarifying(user_message):
+        user_state[chat_id] = CLARIFYING
+        reply = ask_narai_clarify(user_message)
+        await update.message.reply_text(reply)
+        # No buttons, no nudge yet
+        return
+
+    # User has a clear task — give action, start nudge
+    user_resistance_level[chat_id] = 0
+    user_state[chat_id] = ACTION_SENT
+    intent = detect_intent(user_message)
+    reply = ask_narai(user_message, intent)
+    user_last_action[chat_id] = reply
+    await update.message.reply_text(reply, reply_markup=action_buttons())
+    await update.message.reply_text("Gue bakal check in sama lo sekitar 1 jam lagi ya. Gas! 🔥")
     start_nudge(context, chat_id)
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-
-    if chat_id in nudge_tasks:
-        nudge_tasks[chat_id].cancel()
-        del nudge_tasks[chat_id]
+    stop_nudge(chat_id)
 
     await update.message.reply_text("Bentar ya, gue liat dulu list lo... 👀")
 
@@ -263,6 +315,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = ask_narai_from_image(image_base64)
     user_last_action[chat_id] = reply
     user_resistance_level[chat_id] = 0
+    user_state[chat_id] = ACTION_SENT
 
     await update.message.reply_text(reply, reply_markup=action_buttons())
     await update.message.reply_text("Gue bakal check in sama lo sekitar 1 jam lagi ya. Gas! 🔥")
@@ -270,10 +323,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-
-    if chat_id in nudge_tasks:
-        nudge_tasks[chat_id].cancel()
-        del nudge_tasks[chat_id]
+    stop_nudge(chat_id)
 
     doc = update.message.document
     if not doc.file_name.lower().endswith(".pdf"):
@@ -297,6 +347,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = ask_narai_from_list(text[:2000])
     user_last_action[chat_id] = reply
     user_resistance_level[chat_id] = 0
+    user_state[chat_id] = ACTION_SENT
 
     await update.message.reply_text(reply, reply_markup=action_buttons())
     await update.message.reply_text("Gue bakal check in sama lo sekitar 1 jam lagi ya. Gas! 🔥")
