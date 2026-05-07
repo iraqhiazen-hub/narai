@@ -1,4 +1,6 @@
 import os
+import base64
+import fitz  # PyMuPDF for PDF reading
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
@@ -12,7 +14,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Tracks nudge tasks, last action, and resistance level per user
 nudge_tasks = {}
 user_last_action = {}
 user_resistance_level = {}
@@ -71,24 +72,80 @@ Yang harus kamu lakuin:
     )
     return response.choices[0].message.content
 
+def ask_narai_from_list(content_text):
+    prompt = f"""User ini ngirim list tugas mereka. Ini isinya:
+
+{content_text}
+
+Tugas lo:
+- Pilih SATU tugas yang paling konkret atau paling mudah dimulai
+- Kasih satu langkah pertama yang bisa langsung dikerjain sekarang
+- Maksimal 2 kalimat
+- Casual, pakai lo/gue
+- Akhiri dengan dorongan kecil"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Kamu adalah narAI, teman casual yang bantu user mulai kerja."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=150
+    )
+    return response.choices[0].message.content
+
+def ask_narai_from_image(image_base64):
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": """Lo adalah narAI, teman casual yang bantu user mulai kerja.
+User ngirim gambar berisi list tugas atau catatan mereka.
+
+Tugas lo:
+- Baca semua yang ada di gambar
+- Pilih SATU tugas yang paling konkret atau paling mudah dimulai
+- Kasih satu langkah pertama yang bisa langsung dikerjain sekarang
+- Maksimal 2 kalimat
+- Casual, pakai lo/gue
+- Akhiri dengan dorongan kecil seperti "yuk mulai sekarang" atau "coba dulu deh"
+
+Langsung kasih actionnya, jangan jelasin apa yang lo lihat."""
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{image_base64}"
+                        }
+                    }
+                ]
+            }
+        ],
+        max_tokens=150
+    )
+    return response.choices[0].message.content
+
 def ask_narai_simplified(last_action, resistance_level):
     if resistance_level == 1:
         prompt = f"""User menolak untuk melakukan ini: {last_action}
 
-Buat versi yang LEBIH KECIL dari tugas itu. 
+Buat versi yang LEBIH KECIL dari tugas itu.
 Contoh: kalau tugasnya "tulis 3 poin", jadi "tulis 1 poin aja".
 Tetap casual, hangat, 1-2 kalimat, pakai lo/gue."""
-
     else:
         prompt = f"""User masih menolak. Tugas sebelumnya: {last_action}
 
-Buat versi yang PALING KECIL mungkin — sekecil "buka aplikasinya aja" atau "ambil laptopnya dulu".
+Buat versi yang PALING KECIL mungkin seperti "buka aplikasinya aja" atau "ambil laptopnya dulu".
 Tetap casual, hangat, 1-2 kalimat, pakai lo/gue."""
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": "Kamu adalah narAI, teman casual yang bantu user mulai kerja. Selalu pakai bahasa lo/gue yang santai."},
+            {"role": "system", "content": "Kamu adalah narAI, teman casual yang bantu user mulai kerja."},
             {"role": "user", "content": prompt}
         ],
         max_tokens=100
@@ -113,32 +170,32 @@ async def nudge_sequence(context, chat_id):
     await asyncio.sleep(7200)
     await send_nudge(context, chat_id, 2)
 
+def start_nudge(context, chat_id):
+    if chat_id in nudge_tasks:
+        nudge_tasks[chat_id].cancel()
+    task = asyncio.create_task(nudge_sequence(context, chat_id))
+    nudge_tasks[chat_id] = task
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_message = update.message.text
 
-    # Cancel existing nudge if user replies
     if chat_id in nudge_tasks:
         nudge_tasks[chat_id].cancel()
         del nudge_tasks[chat_id]
 
-    # Check if user is done
     if is_done(user_message) and chat_id in user_last_action:
         user_resistance_level[chat_id] = 0
         await update.message.reply_text("Niceee, gue bangga sama lo! 🙌 Mau lanjut ke hal berikutnya?")
         return
 
-    # Check if user is resisting
     if is_resistance(user_message) and chat_id in user_last_action:
         level = user_resistance_level.get(chat_id, 0) + 1
         user_resistance_level[chat_id] = min(level, 2)
-
         simplified = ask_narai_simplified(user_last_action[chat_id], level)
         user_last_action[chat_id] = simplified
         await update.message.reply_text(simplified)
-
     else:
-        # Normal flow
         user_resistance_level[chat_id] = 0
         intent = detect_intent(user_message)
         reply = ask_narai(user_message, intent)
@@ -146,12 +203,70 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
         await update.message.reply_text("Gue bakal check in sama lo sekitar 1 jam lagi ya. Gas! 🔥")
 
-    # Restart nudge sequence
-    task = asyncio.create_task(nudge_sequence(context, chat_id))
-    nudge_tasks[chat_id] = task
+    start_nudge(context, chat_id)
+
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    if chat_id in nudge_tasks:
+        nudge_tasks[chat_id].cancel()
+        del nudge_tasks[chat_id]
+
+    await update.message.reply_text("Bentar ya, gue liat dulu list lo... 👀")
+
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    file_bytes = await file.download_as_bytearray()
+    image_base64 = base64.b64encode(file_bytes).decode("utf-8")
+
+    reply = ask_narai_from_image(image_base64)
+    user_last_action[chat_id] = reply
+    user_resistance_level[chat_id] = 0
+
+    await update.message.reply_text(reply)
+    await update.message.reply_text("Gue bakal check in sama lo sekitar 1 jam lagi ya. Gas! 🔥")
+
+    start_nudge(context, chat_id)
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    if chat_id in nudge_tasks:
+        nudge_tasks[chat_id].cancel()
+        del nudge_tasks[chat_id]
+
+    doc = update.message.document
+    if not doc.file_name.lower().endswith(".pdf"):
+        await update.message.reply_text("Sekarang gue cuma bisa baca PDF sama gambar ya. Coba kirim dalam format itu!")
+        return
+
+    await update.message.reply_text("Bentar ya, gue baca PDF lo dulu... 📄")
+
+    file = await context.bot.get_file(doc.file_id)
+    file_bytes = await file.download_as_bytearray()
+
+    pdf = fitz.open(stream=bytes(file_bytes), filetype="pdf")
+    text = ""
+    for page in pdf:
+        text += page.get_text()
+
+    if not text.strip():
+        await update.message.reply_text("Hmm, PDF-nya kayaknya kosong atau ga bisa dibaca. Coba kirim sebagai gambar aja!")
+        return
+
+    reply = ask_narai_from_list(text[:2000])
+    user_last_action[chat_id] = reply
+    user_resistance_level[chat_id] = 0
+
+    await update.message.reply_text(reply)
+    await update.message.reply_text("Gue bakal check in sama lo sekitar 1 jam lagi ya. Gas! 🔥")
+
+    start_nudge(context, chat_id)
 
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
 print("narAI is running...")
 app.run_polling()
