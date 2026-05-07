@@ -1,9 +1,9 @@
 import os
 import base64
-import fitz  # PyMuPDF for PDF reading
+import fitz
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from openai import OpenAI
 import asyncio
 
@@ -23,6 +23,15 @@ RESISTANCE_WORDS = [
     "later", "ga bisa", "susah", "malas", "belum",
     "ga sanggup", "overwhelmed", "berat"
 ]
+
+def action_buttons():
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Udah done!", callback_data="done"),
+            InlineKeyboardButton("😩 Males ah", callback_data="resist")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 def detect_intent(message):
     message = message.lower()
@@ -112,15 +121,13 @@ Tugas lo:
 - Kasih satu langkah pertama yang bisa langsung dikerjain sekarang
 - Maksimal 2 kalimat
 - Casual, pakai lo/gue
-- Akhiri dengan dorongan kecil seperti "yuk mulai sekarang" atau "coba dulu deh"
+- Akhiri dengan dorongan kecil
 
 Langsung kasih actionnya, jangan jelasin apa yang lo lihat."""
                     },
                     {
                         "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{image_base64}"
-                        }
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}
                     }
                 ]
             }
@@ -156,12 +163,14 @@ async def send_nudge(context, chat_id, nudge_number):
     if nudge_number == 1:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Eh gimana, udah mulai belum? 👀"
+            text="Eh gimana, udah mulai belum? 👀",
+            reply_markup=action_buttons()
         )
     elif nudge_number == 2:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="Gapapa, coba 2 menit aja deh. Ga perlu selesai, yang penting mulai. 💪"
+            text="Gapapa, coba 2 menit aja deh. Ga perlu selesai, yang penting mulai. 💪",
+            reply_markup=action_buttons()
         )
 
 async def nudge_sequence(context, chat_id):
@@ -175,6 +184,38 @@ def start_nudge(context, chat_id):
         nudge_tasks[chat_id].cancel()
     task = asyncio.create_task(nudge_sequence(context, chat_id))
     nudge_tasks[chat_id] = task
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+
+    if chat_id in nudge_tasks:
+        nudge_tasks[chat_id].cancel()
+        del nudge_tasks[chat_id]
+
+    if query.data == "done":
+        user_resistance_level[chat_id] = 0
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Niceee, gue bangga sama lo! 🙌 Mau lanjut ke hal berikutnya?"
+        )
+
+    elif query.data == "resist":
+        level = user_resistance_level.get(chat_id, 0) + 1
+        user_resistance_level[chat_id] = min(level, 2)
+        await query.edit_message_reply_markup(reply_markup=None)
+
+        simplified = ask_narai_simplified(user_last_action.get(chat_id, "tugas lo"), level)
+        user_last_action[chat_id] = simplified
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=simplified,
+            reply_markup=action_buttons()
+        )
+        start_nudge(context, chat_id)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -194,13 +235,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_resistance_level[chat_id] = min(level, 2)
         simplified = ask_narai_simplified(user_last_action[chat_id], level)
         user_last_action[chat_id] = simplified
-        await update.message.reply_text(simplified)
+        await update.message.reply_text(simplified, reply_markup=action_buttons())
     else:
         user_resistance_level[chat_id] = 0
         intent = detect_intent(user_message)
         reply = ask_narai(user_message, intent)
         user_last_action[chat_id] = reply
-        await update.message.reply_text(reply)
+        await update.message.reply_text(reply, reply_markup=action_buttons())
         await update.message.reply_text("Gue bakal check in sama lo sekitar 1 jam lagi ya. Gas! 🔥")
 
     start_nudge(context, chat_id)
@@ -223,9 +264,8 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_last_action[chat_id] = reply
     user_resistance_level[chat_id] = 0
 
-    await update.message.reply_text(reply)
+    await update.message.reply_text(reply, reply_markup=action_buttons())
     await update.message.reply_text("Gue bakal check in sama lo sekitar 1 jam lagi ya. Gas! 🔥")
-
     start_nudge(context, chat_id)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -258,15 +298,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_last_action[chat_id] = reply
     user_resistance_level[chat_id] = 0
 
-    await update.message.reply_text(reply)
+    await update.message.reply_text(reply, reply_markup=action_buttons())
     await update.message.reply_text("Gue bakal check in sama lo sekitar 1 jam lagi ya. Gas! 🔥")
-
     start_nudge(context, chat_id)
 
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 app.add_handler(MessageHandler(filters.PHOTO, handle_image))
 app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+app.add_handler(CallbackQueryHandler(handle_button))
 
 print("narAI is running...")
 app.run_polling()
