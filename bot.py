@@ -104,26 +104,46 @@ def is_resistance(message):
     message = message.lower()
     return any(word in message for word in RESISTANCE_WORDS)
 
-def is_done(message):
-    message = message.lower()
-    return any(word in message for word in ["done", "sudah", "udah", "selesai", "beres", "ok", "yes", "ya", "yep"])
+def classify_user_intent(user_message, last_action, current_state):
+    """
+    GPT decides what the user actually means:
+    - DONE: user is confirming they completed the task
+    - RESIST: user is resisting or avoiding
+    - NEW_TASK: user has a new specific task
+    - QUESTION: user is asking a question
+    - NO_TASK: user is stuck/overwhelmed but no specific task yet
+    """
+    context_str = f"Aksi terakhir yang diberikan narAI: {last_action}" if last_action else "Belum ada aksi sebelumnya."
 
-def classify_message(user_message):
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {
                 "role": "system",
-                "content": """Kamu adalah classifier. Jawab HANYA dengan satu kata:
-- HAS_TASK → kalau user menyebut tugas spesifik
-- NO_TASK → kalau user tidak menyebut tugas spesifik"""
+                "content": f"""Kamu adalah classifier intent untuk narAI.
+
+{context_str}
+Status saat ini: {current_state}
+
+Klasifikasikan pesan user dengan TEPAT. Jawab HANYA dengan satu kata:
+
+- DONE → user mengkonfirmasi bahwa mereka sudah selesai mengerjakan tugas (contoh: "udah selesai", "done", "sudah dikerjain", "kelar")
+- RESIST → user menolak atau menghindar dari tugas (contoh: "males", "ga mau", "nanti aja", "susah")
+- NEW_TASK → user menyebut tugas atau pekerjaan spesifik yang baru (contoh: "gue harus bikin laporan", "mau ngerjain presentasi")
+- QUESTION → user bertanya sesuatu, minta info, atau minta saran (contoh: "apakah...", "gimana caranya", "bisa bantu cari tau", "menurut lo", "apa yang harus")
+- NO_TASK → user stuck/overwhelmed tapi belum menyebut tugas spesifik (contoh: "gue stuck", "banyak banget kerjaan", "overwhelmed")
+
+PENTING: Kalau ada tanda tanya atau kata tanya (apakah, gimana, apa, bagaimana, kenapa), itu hampir pasti QUESTION bukan DONE."""
             },
             {"role": "user", "content": user_message}
         ],
         max_tokens=10
     )
     result = response.choices[0].message.content.strip().upper()
-    return "HAS_TASK" if "HAS_TASK" in result else "NO_TASK"
+    for intent in ["DONE", "RESIST", "NEW_TASK", "QUESTION", "NO_TASK"]:
+        if intent in result:
+            return intent
+    return "NEW_TASK"
 
 def ask_narai_clarify(user_message, user_profile=None):
     name = user_profile.get("name", "") if user_profile else ""
@@ -162,17 +182,47 @@ Gaya ngobrol kamu:
 - Casual, hangat, kayak teman deket
 - Pakai nama mereka kalau kamu tau
 - Pakai bahasa sehari-hari (lo/gue)
-- Pendek dan to the point
+- SANGAT pendek — maksimal 2 kalimat
+- Spesifik ke tugas yang mereka sebut, jangan generik
 
 Yang harus kamu lakuin:
-- Kasih SATU langkah kecil yang bisa langsung dikerjain sekarang
-- Maksimal 2 kalimat
-- Bisa dikerjain dalam 10 menit atau kurang
-- Akhiri dengan dorongan kecil"""
+- Kasih SATU langkah pertama yang paling konkret dan paling kecil
+- Harus bisa dikerjain dalam 10 menit atau kurang
+- Jangan kasih multiple steps
+- Akhiri dengan dorongan pendek"""
             },
             {"role": "user", "content": user_message}
         ],
-        max_tokens=100
+        max_tokens=80
+    )
+    return response.choices[0].message.content
+
+def ask_narai_answer_question(user_message, last_action, user_profile=None):
+    """narAI answers user's question but still redirects to action"""
+    name = user_profile.get("name", "") if user_profile else ""
+    name_str = f"Nama user adalah {name}." if name else ""
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": f"""Kamu adalah narAI, teman casual yang bantu user mulai kerja. {name_str}
+
+User bertanya sesuatu. Jawab pertanyaan mereka dengan singkat dan helpful, lalu redirect ke aksi.
+
+Aturan:
+- Jawab pertanyaannya dulu dengan singkat (1-2 kalimat)
+- Lalu kasih satu langkah kecil yang bisa dilakukan sekarang berdasarkan konteks
+- Maksimal 3 kalimat total
+- Casual, pakai lo/gue
+- Jangan terlalu panjang"""
+            },
+            {
+                "role": "user",
+                "content": f"Konteks tugas sebelumnya: {last_action}\n\nPertanyaan user: {user_message}"
+            }
+        ],
+        max_tokens=120
     )
     return response.choices[0].message.content
 
@@ -191,7 +241,7 @@ Buat versi PALING KECIL mungkin seperti "buka aplikasinya aja". Casual, 1-2 kali
             {"role": "system", "content": "Kamu adalah narAI, teman casual yang bantu user mulai kerja."},
             {"role": "user", "content": prompt}
         ],
-        max_tokens=100
+        max_tokens=80
     )
     return response.choices[0].message.content
 
@@ -210,7 +260,7 @@ def ask_narai_from_image(image_base64, user_profile=None):
 User ngirim gambar berisi list tugas mereka.
 - Baca semua yang ada di gambar
 - Pilih SATU tugas paling konkret atau paling mudah
-- Kasih satu langkah pertama
+- Kasih satu langkah pertama yang spesifik
 - Maksimal 2 kalimat, casual, pakai lo/gue
 - Pakai nama mereka kalau kamu tau
 - Akhiri dengan dorongan kecil"""
@@ -222,7 +272,7 @@ User ngirim gambar berisi list tugas mereka.
                 ]
             }
         ],
-        max_tokens=150
+        max_tokens=120
     )
     return response.choices[0].message.content
 
@@ -242,10 +292,10 @@ def ask_narai_from_list(content_text, user_profile=None):
 
 {content_text}
 
-Pilih SATU tugas paling konkret. Kasih satu langkah pertama. Maksimal 2 kalimat. Casual, pakai lo/gue. Pakai nama mereka kalau kamu tau. Akhiri dengan dorongan kecil."""
+Pilih SATU tugas paling konkret. Kasih satu langkah pertama yang spesifik. Maksimal 2 kalimat. Casual, pakai lo/gue. Pakai nama mereka kalau kamu tau. Akhiri dengan dorongan kecil."""
             }
         ],
-        max_tokens=150
+        max_tokens=120
     )
     return response.choices[0].message.content
 
@@ -393,6 +443,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stop_nudge(chat_id)
     user_profile = get_user(chat_id)
 
+    # --- ONBOARDING FLOW ---
     if user_profile is None and current_state is None:
         user_state[chat_id] = ONBOARDING_NAME
         await update.message.reply_text(
@@ -431,34 +482,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # --- SMART INTENT DETECTION ---
     name = user_profile.get("name", "") if user_profile else ""
+    last_action = user_last_action.get(chat_id, "")
 
-    if is_done(user_message) and user_state.get(chat_id) == ACTION_SENT:
+    intent = classify_user_intent(user_message, last_action, current_state)
+
+    if intent == "DONE" and current_state == ACTION_SENT:
         user_resistance_level[chat_id] = 0
         user_state[chat_id] = CLARIFYING
-        log_session(chat_id, user_last_action.get(chat_id, ""), "done")
+        log_session(chat_id, last_action, "done")
         msg = f"Niceee{' ' + name if name else ''}, gue bangga sama lo! 🙌 Mau lanjut ke hal berikutnya?"
         await update.message.reply_text(msg)
-        return
 
-    if is_resistance(user_message) and user_state.get(chat_id) == ACTION_SENT:
+    elif intent == "RESIST" and current_state == ACTION_SENT:
         level = user_resistance_level.get(chat_id, 0) + 1
         user_resistance_level[chat_id] = min(level, 2)
-        log_session(chat_id, user_last_action.get(chat_id, ""), "resist")
-        simplified = ask_narai_simplified(user_last_action[chat_id], level, user_profile)
+        log_session(chat_id, last_action, "resist")
+        simplified = ask_narai_simplified(last_action, level, user_profile)
         user_last_action[chat_id] = simplified
         user_state[chat_id] = ACTION_SENT
         await update.message.reply_text(simplified, reply_markup=action_buttons())
         start_nudge(context, chat_id, user_profile)
-        return
 
-    classification = classify_message(user_message)
+    elif intent == "QUESTION":
+        # Answer the question but redirect to action
+        reply = ask_narai_answer_question(user_message, last_action, user_profile)
+        await update.message.reply_text(reply)
+        # Don't change state or start nudge for questions
 
-    if classification == "NO_TASK":
+    elif intent == "NO_TASK":
         user_state[chat_id] = CLARIFYING
         reply = ask_narai_clarify(user_message, user_profile)
         await update.message.reply_text(reply)
+
     else:
+        # NEW_TASK or anything else — give action
         user_resistance_level[chat_id] = 0
         user_state[chat_id] = ACTION_SENT
         reply = ask_narai_action(user_message, user_profile)
