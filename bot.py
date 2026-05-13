@@ -7,6 +7,8 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandle
 from openai import OpenAI
 from supabase import create_client
 import asyncio
+from datetime import datetime, timezone, timedelta
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv()
 
@@ -54,6 +56,13 @@ def get_user(user_id):
     except:
         return None
 
+def get_all_users():
+    try:
+        result = supabase.table("users").select("*").execute()
+        return result.data
+    except:
+        return []
+
 def save_user(user_id, name, job, struggle):
     try:
         supabase.table("users").upsert({
@@ -67,17 +76,45 @@ def save_user(user_id, name, job, struggle):
 
 def log_session(user_id, action, outcome):
     try:
+        now = datetime.now(timezone.utc)
+        day = now.strftime("%A")
         supabase.table("sessions").insert({
             "user_id": user_id,
             "action_sent": action,
-            "outcome": outcome
+            "outcome": outcome,
+            "day_of_week": day
         }).execute()
     except:
         pass
 
+def get_weekly_stats(user_id):
+    try:
+        week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        sessions = supabase.table("sessions").select("*").eq("user_id", user_id).gte("created_at", week_ago).execute()
+        data = sessions.data
+        total = len(data)
+        done = len([s for s in data if s["outcome"] == "done"])
+        resist = len([s for s in data if s["outcome"] == "resist"])
+
+        day_counts = {}
+        for s in data:
+            day = s.get("day_of_week", "")
+            if day:
+                day_counts[day] = day_counts.get(day, 0) + 1
+
+        best_day = max(day_counts, key=day_counts.get) if day_counts else None
+
+        return {
+            "total": total,
+            "done": done,
+            "resist": resist,
+            "best_day": best_day
+        }
+    except:
+        return None
+
 def get_stats():
     try:
-        from datetime import datetime, timezone
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         all_users = supabase.table("users").select("*").execute()
         total_users = len(all_users.data)
@@ -101,8 +138,38 @@ def get_stats():
     except:
         return None
 
+def generate_weekly_summary(name, stats, lang="ID"):
+    if not stats or stats["total"] == 0:
+        if lang == "EN":
+            return f"Hey {name}! 👋 We didn't chat much this week. Whenever you're stuck or overwhelmed — I'm here. Let's make next week count! 🔥"
+        else:
+            return f"Eh {name}! 👋 Minggu ini kita belum banyak ngobrol. Kapanpun lo stuck atau overwhelmed — gue di sini. Yuk minggu depan kita gas bareng! 🔥"
+
+    best_day_str = f"\n\n📅 Hari paling produktif lo: *{stats['best_day']}*" if stats['best_day'] else ""
+    best_day_str_en = f"\n\n📅 Your most productive day: *{stats['best_day']}*" if stats['best_day'] else ""
+
+    if lang == "EN":
+        msg = f"""Hey {name}, here's your week recap! 🎯
+
+You chatted with me *{stats['total']} times* this week.
+✅ Tasks started: *{stats['done']}*
+😩 Needed extra push: *{stats['resist']} times*{best_day_str_en}
+
+{"You're on a roll! Keep it up 💪" if stats['done'] >= 3 else "Every small step counts. Next week let's do even better! 🔥"}"""
+    else:
+        msg = f"""Eh {name}, recap minggu ini! 🎯
+
+Lo ngobrol sama gue *{stats['total']} kali* minggu ini.
+✅ Berhasil mulai: *{stats['done']} hal*
+😩 Butuh dorongan ekstra: *{stats['resist']} kali*{best_day_str}
+
+{"Keren banget minggu ini! Terus gas ya 💪" if stats['done'] >= 3 else "Setiap langkah kecil itu berarti. Minggu depan kita lebih gas lagi! 🔥"}
+
+Gue tetep di sini buat lo. Sampai minggu depan! 👋"""
+
+    return msg
+
 def detect_language(message):
-    """Detect if message is English or Indonesian"""
     english_words = ["i", "the", "you", "can", "what", "how", "is", "are", "my", "me",
                      "need", "want", "help", "have", "do", "in", "to", "a", "and", "it",
                      "speak", "english", "please", "working", "task", "stuck", "overwhelmed"]
@@ -144,10 +211,10 @@ Classify the user message. Reply with ONLY one word:
 - DONE → user confirms they completed the task (e.g. "done", "finished", "udah selesai", "kelar", "beres")
 - RESIST → user is avoiding or resisting the task (e.g. "males", "ga mau", "later", "too hard")
 - NEW_TASK → user mentions a specific new task or work item
-- QUESTION → user is asking something, requesting info or advice (look for question marks, words like "apakah", "gimana", "can you", "how", "what", "bisa bantu")
+- QUESTION → user is asking something, requesting info or advice (look for question marks, words like "apakah", "gimana", "can you", "how", "what", "kenapa", "bagaimana", "bisa bantu")
 - NO_TASK → user is stuck/overwhelmed but hasn't mentioned a specific task
 
-CRITICAL: If the message contains a question mark OR question words (apakah, gimana, can you, how, what, kenapa, bagaimana, bisa bantu, tolong), classify as QUESTION not DONE."""
+CRITICAL: If the message contains a question mark OR question words, classify as QUESTION not DONE."""
             },
             {"role": "user", "content": user_message}
         ],
@@ -163,7 +230,6 @@ def ask_narai_clarify(user_message, user_profile=None, lang="ID"):
     name = user_profile.get("name", "") if user_profile else ""
     name_str = f"User's name is {name}." if name else ""
     lang_instruction = get_language_instruction(lang)
-
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -171,7 +237,6 @@ def ask_narai_clarify(user_message, user_profile=None, lang="ID"):
                 "role": "system",
                 "content": f"""You are narAI, a casual friendly coach that helps users start working. {name_str}
 {lang_instruction}
-
 Ask ONE short question to help the user identify one specific task.
 Max 2 sentences. Casual and warm. Don't give action yet."""
             },
@@ -185,13 +250,11 @@ def ask_narai_action(user_message, user_profile=None, lang="ID"):
     name = user_profile.get("name", "") if user_profile else ""
     struggle = user_profile.get("biggest_struggle", "") if user_profile else ""
     lang_instruction = get_language_instruction(lang)
-
     context_str = ""
     if name:
         context_str += f"User's name is {name}. "
     if struggle:
         context_str += f"They usually struggle with: {struggle}. "
-
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -202,7 +265,7 @@ def ask_narai_action(user_message, user_profile=None, lang="ID"):
 
 Rules:
 - Give ONE very specific first step they can do RIGHT NOW
-- Max 2 sentences — be concise
+- Max 2 sentences
 - Must be doable in under 10 minutes
 - Use their name if you know it
 - End with a small encouraging push
@@ -218,7 +281,6 @@ def ask_narai_answer_question(user_message, last_action, user_profile=None, lang
     name = user_profile.get("name", "") if user_profile else ""
     name_str = f"User's name is {name}." if name else ""
     lang_instruction = get_language_instruction(lang)
-
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -226,14 +288,8 @@ def ask_narai_answer_question(user_message, last_action, user_profile=None, lang
                 "role": "system",
                 "content": f"""You are narAI, a casual friendly coach. {name_str}
 {lang_instruction}
-
-The user asked a question. Answer it briefly and helpfully, then redirect to one small action.
-
-Rules:
-- Answer their question first (1-2 sentences)
-- Then suggest one small next step based on context
-- Max 3 sentences total
-- Casual and warm"""
+Answer their question briefly then redirect to one small action.
+Max 3 sentences total. Casual and warm."""
             },
             {
                 "role": "user",
@@ -248,21 +304,16 @@ def ask_narai_simplified(last_action, resistance_level, user_profile=None, lang=
     name = user_profile.get("name", "") if user_profile else ""
     name_str = f"User's name is {name}." if name else ""
     lang_instruction = get_language_instruction(lang)
-
     if resistance_level == 1:
         prompt = f"""{name_str} User is resisting this task: {last_action}
-Make a SMALLER version of the task. 1-2 sentences. Casual."""
+Make a SMALLER version. 1-2 sentences. Casual."""
     else:
-        prompt = f"""{name_str} User is still resisting. Previous task: {last_action}
-Make the SMALLEST possible version — like "just open the app". 1-2 sentences. Casual."""
-
+        prompt = f"""{name_str} User still resisting. Previous task: {last_action}
+Make the SMALLEST possible version like "just open the app". 1-2 sentences. Casual."""
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {
-                "role": "system",
-                "content": f"You are narAI, a casual friendly coach. {lang_instruction}"
-            },
+            {"role": "system", "content": f"You are narAI, a casual friendly coach. {lang_instruction}"},
             {"role": "user", "content": prompt}
         ],
         max_tokens=80
@@ -273,7 +324,6 @@ def ask_narai_from_image(image_base64, user_profile=None, lang="ID"):
     name = user_profile.get("name", "") if user_profile else ""
     name_str = f"User's name is {name}." if name else ""
     lang_instruction = get_language_instruction(lang)
-
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
@@ -307,7 +357,6 @@ def ask_narai_from_list(content_text, user_profile=None, lang="ID"):
     name = user_profile.get("name", "") if user_profile else ""
     name_str = f"User's name is {name}." if name else ""
     lang_instruction = get_language_instruction(lang)
-
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -332,23 +381,11 @@ async def send_nudge(context, chat_id, nudge_number, user_profile=None):
     name = user_profile.get("name", "") if user_profile else ""
     name_str = f" {name}" if name else ""
     lang = user_language.get(chat_id, "ID")
-
     if lang == "EN":
-        if nudge_number == 1:
-            text = f"Hey{name_str}, how's it going? Did you get started? 👀"
-        else:
-            text = f"No worries{name_str}, just try 2 minutes. You don't need to finish — just start. 💪"
+        text = f"Hey{name_str}, how's it going? Did you get started? 👀" if nudge_number == 1 else f"No worries{name_str}, just try 2 minutes. You don't need to finish — just start. 💪"
     else:
-        if nudge_number == 1:
-            text = f"Eh{name_str}, gimana? Udah mulai belum? 👀"
-        else:
-            text = f"Gapapa{name_str}, coba 2 menit aja deh. Ga perlu selesai, yang penting mulai. 💪"
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=action_buttons()
-    )
+        text = f"Eh{name_str}, gimana? Udah mulai belum? 👀" if nudge_number == 1 else f"Gapapa{name_str}, coba 2 menit aja deh. Ga perlu selesai, yang penting mulai. 💪"
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=action_buttons())
 
 async def nudge_sequence(context, chat_id, user_profile=None):
     await asyncio.sleep(3600)
@@ -366,6 +403,22 @@ def stop_nudge(chat_id):
     if chat_id in nudge_tasks:
         nudge_tasks[chat_id].cancel()
         del nudge_tasks[chat_id]
+
+async def send_weekly_summaries(bot):
+    """Runs every Sunday at 7pm WIB (12:00 UTC)"""
+    print("Sending weekly summaries...")
+    users = get_all_users()
+    for user in users:
+        try:
+            user_id = user["user_id"]
+            name = user.get("name", "")
+            lang = user_language.get(user_id, "ID")
+            stats = get_weekly_stats(user_id)
+            msg = generate_weekly_summary(name, stats, lang)
+            await bot.send_message(chat_id=user_id, text=msg, parse_mode="Markdown")
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            print(f"Failed to send summary to {user_id}: {e}")
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -470,16 +523,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_resistance_level[chat_id] = min(level, 2)
         log_session(chat_id, user_last_action.get(chat_id, ""), "resist")
         await query.edit_message_reply_markup(reply_markup=None)
-        simplified = ask_narai_simplified(
-            user_last_action.get(chat_id, "the task"), level, user_profile, lang
-        )
+        simplified = ask_narai_simplified(user_last_action.get(chat_id, "the task"), level, user_profile, lang)
         user_last_action[chat_id] = simplified
         user_state[chat_id] = ACTION_SENT
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=simplified,
-            reply_markup=action_buttons()
-        )
+        await context.bot.send_message(chat_id=chat_id, text=simplified, reply_markup=action_buttons())
         start_nudge(context, chat_id, user_profile)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -489,11 +536,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stop_nudge(chat_id)
     user_profile = get_user(chat_id)
 
-    # Detect and store language
     lang = detect_language(user_message)
     user_language[chat_id] = lang
 
-    # --- ONBOARDING FLOW ---
     if user_profile is None and current_state is None:
         user_state[chat_id] = ONBOARDING_NAME
         await update.message.reply_text(
@@ -532,7 +577,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- SMART INTENT DETECTION ---
     name = user_profile.get("name", "") if user_profile else ""
     last_action = user_last_action.get(chat_id, "")
     intent = classify_user_intent(user_message, last_action, current_state)
@@ -586,12 +630,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_profile = get_user(chat_id)
     lang = user_language.get(chat_id, "ID")
     name = user_profile.get("name", "") if user_profile else ""
-
-    if lang == "EN":
-        await update.message.reply_text("Hold on, let me check your list... 👀")
-    else:
-        await update.message.reply_text("Bentar ya, gue liat dulu list lo... 👀")
-
+    await update.message.reply_text("Hold on, let me check your list... 👀" if lang == "EN" else "Bentar ya, gue liat dulu list lo... 👀")
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     file_bytes = await file.download_as_bytearray()
@@ -601,12 +640,9 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_resistance_level[chat_id] = 0
     user_state[chat_id] = ACTION_SENT
     log_session(chat_id, reply, "sent")
-
     await update.message.reply_text(reply, reply_markup=action_buttons())
-    if lang == "EN":
-        await update.message.reply_text(f"I'll check in with you in about an hour{' ' + name if name else ''}. Let's go! 🔥")
-    else:
-        await update.message.reply_text(f"Gue bakal check in sama lo sekitar 1 jam lagi ya{' ' + name if name else ''}. Gas! 🔥")
+    check_in = f"I'll check in with you in about an hour{' ' + name if name else ''}. Let's go! 🔥" if lang == "EN" else f"Gue bakal check in sama lo sekitar 1 jam lagi ya{' ' + name if name else ''}. Gas! 🔥"
+    await update.message.reply_text(check_in)
     start_nudge(context, chat_id, user_profile)
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -615,42 +651,44 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_profile = get_user(chat_id)
     lang = user_language.get(chat_id, "ID")
     name = user_profile.get("name", "") if user_profile else ""
-
     doc = update.message.document
     if not doc.file_name.lower().endswith(".pdf"):
-        msg = "I can only read PDFs and images right now!" if lang == "EN" else "Sekarang gue cuma bisa baca PDF sama gambar ya!"
-        await update.message.reply_text(msg)
+        await update.message.reply_text("I can only read PDFs and images right now!" if lang == "EN" else "Sekarang gue cuma bisa baca PDF sama gambar ya!")
         return
-
-    msg = "Hold on, reading your PDF... 📄" if lang == "EN" else "Bentar ya, gue baca PDF lo dulu... 📄"
-    await update.message.reply_text(msg)
-
+    await update.message.reply_text("Hold on, reading your PDF... 📄" if lang == "EN" else "Bentar ya, gue baca PDF lo dulu... 📄")
     file = await context.bot.get_file(doc.file_id)
     file_bytes = await file.download_as_bytearray()
     pdf = fitz.open(stream=bytes(file_bytes), filetype="pdf")
     text = ""
     for page in pdf:
         text += page.get_text()
-
     if not text.strip():
-        msg = "Hmm, the PDF seems empty or unreadable. Try sending it as an image!" if lang == "EN" else "Hmm PDF-nya kosong atau ga bisa dibaca. Coba kirim sebagai gambar aja!"
-        await update.message.reply_text(msg)
+        await update.message.reply_text("Hmm, the PDF seems empty. Try sending as an image!" if lang == "EN" else "Hmm PDF-nya kosong. Coba kirim sebagai gambar aja!")
         return
-
     reply = ask_narai_from_list(text[:2000], user_profile, lang)
     user_last_action[chat_id] = reply
     user_resistance_level[chat_id] = 0
     user_state[chat_id] = ACTION_SENT
     log_session(chat_id, reply, "sent")
-
     await update.message.reply_text(reply, reply_markup=action_buttons())
-    if lang == "EN":
-        await update.message.reply_text(f"I'll check in with you in about an hour{' ' + name if name else ''}. Let's go! 🔥")
-    else:
-        await update.message.reply_text(f"Gue bakal check in sama lo sekitar 1 jam lagi ya{' ' + name if name else ''}. Gas! 🔥")
+    check_in = f"I'll check in with you in about an hour{' ' + name if name else ''}. Let's go! 🔥" if lang == "EN" else f"Gue bakal check in sama lo sekitar 1 jam lagi ya{' ' + name if name else ''}. Gas! 🔥"
+    await update.message.reply_text(check_in)
     start_nudge(context, chat_id, user_profile)
 
-app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+async def post_init(application):
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(
+        send_weekly_summaries,
+        "cron",
+        day_of_week="sun",
+        hour=12,
+        minute=0,
+        args=[application.bot]
+    )
+    scheduler.start()
+    print("Weekly summary scheduler started — every Sunday 7pm WIB")
+
+app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 app.add_handler(CommandHandler("start", handle_start))
 app.add_handler(CommandHandler("help", handle_help))
 app.add_handler(CommandHandler("stuck", handle_stuck_cmd))
