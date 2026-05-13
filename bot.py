@@ -78,22 +78,17 @@ def get_stats():
     try:
         from datetime import datetime, timezone
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
         all_users = supabase.table("users").select("*").execute()
         total_users = len(all_users.data)
-
         new_today = supabase.table("users").select("*").gte("created_at", today).execute()
         new_users_today = len(new_today.data)
-
         all_sessions = supabase.table("sessions").select("*").execute()
         total_actions = len([s for s in all_sessions.data if s["outcome"] == "sent"])
         total_done = len([s for s in all_sessions.data if s["outcome"] == "done"])
         total_resist = len([s for s in all_sessions.data if s["outcome"] == "resist"])
-
         completion_rate = 0
         if total_done + total_resist > 0:
             completion_rate = round(total_done / (total_done + total_resist) * 100)
-
         return {
             "total_users": total_users,
             "new_today": new_users_today,
@@ -133,7 +128,6 @@ def classify_message(user_message):
 def ask_narai_clarify(user_message, user_profile=None):
     name = user_profile.get("name", "") if user_profile else ""
     name_str = f"Nama user adalah {name}." if name else ""
-
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -152,13 +146,11 @@ Maksimal 2 kalimat. Casual, pakai lo/gue. Jangan kasih action dulu."""
 def ask_narai_action(user_message, user_profile=None):
     name = user_profile.get("name", "") if user_profile else ""
     struggle = user_profile.get("biggest_struggle", "") if user_profile else ""
-
     context_str = ""
     if name:
         context_str += f"Nama user adalah {name}. "
     if struggle:
         context_str += f"Mereka biasanya paling struggle dengan: {struggle}. "
-
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -169,7 +161,7 @@ def ask_narai_action(user_message, user_profile=None):
 Gaya ngobrol kamu:
 - Casual, hangat, kayak teman deket
 - Pakai nama mereka kalau kamu tau
-- Pakai bahasa sehari-hari
+- Pakai bahasa sehari-hari (lo/gue)
 - Pendek dan to the point
 
 Yang harus kamu lakuin:
@@ -187,14 +179,12 @@ Yang harus kamu lakuin:
 def ask_narai_simplified(last_action, resistance_level, user_profile=None):
     name = user_profile.get("name", "") if user_profile else ""
     name_str = f"Nama user adalah {name}." if name else ""
-
     if resistance_level == 1:
         prompt = f"""{name_str} User menolak untuk melakukan ini: {last_action}
 Buat versi yang LEBIH KECIL. Casual, 1-2 kalimat, pakai lo/gue."""
     else:
         prompt = f"""{name_str} User masih menolak. Tugas sebelumnya: {last_action}
 Buat versi PALING KECIL mungkin seperti "buka aplikasinya aja". Casual, 1-2 kalimat, pakai lo/gue."""
-
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -208,7 +198,6 @@ Buat versi PALING KECIL mungkin seperti "buka aplikasinya aja". Casual, 1-2 kali
 def ask_narai_from_image(image_base64, user_profile=None):
     name = user_profile.get("name", "") if user_profile else ""
     name_str = f"Nama user adalah {name}." if name else ""
-
     response = client.chat.completions.create(
         model="gpt-4o",
         messages=[
@@ -240,7 +229,6 @@ User ngirim gambar berisi list tugas mereka.
 def ask_narai_from_list(content_text, user_profile=None):
     name = user_profile.get("name", "") if user_profile else ""
     name_str = f"Nama user adalah {name}." if name else ""
-
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -264,7 +252,6 @@ Pilih SATU tugas paling konkret. Kasih satu langkah pertama. Maksimal 2 kalimat.
 async def send_nudge(context, chat_id, nudge_number, user_profile=None):
     name = user_profile.get("name", "") if user_profile else ""
     name_str = f" {name}" if name else ""
-
     if nudge_number == 1:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -295,15 +282,66 @@ def stop_nudge(chat_id):
         nudge_tasks[chat_id].cancel()
         del nudge_tasks[chat_id]
 
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_profile = get_user(chat_id)
+    if user_profile:
+        name = user_profile.get("name", "")
+        user_state[chat_id] = CLARIFYING
+        await update.message.reply_text(
+            f"Hai lagi *{name}*! 👋 Gue narAI, masih di sini buat lo.\n\nSekarang lagi ngerjain apa? Cerita aja.",
+            parse_mode="Markdown"
+        )
+    else:
+        user_state[chat_id] = ONBOARDING_NAME
+        await update.message.reply_text(
+            "Hai! Gue narAI 👋\n\nGue di sini buat bantu lo mulai ngerjain sesuatu pas lo lagi stuck, overwhelmed, atau capek.\n\nSebelum mulai, boleh kenalan dulu? *Nama lo siapa?*",
+            parse_mode="Markdown"
+        )
+
+async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Cara pakai narAI gampang banget:\n\n"
+        "1️⃣ Ceritain apa yang lagi lo kerjain atau rasain\n"
+        "2️⃣ narAI kasih lo SATU langkah kecil\n"
+        "3️⃣ Tap *Udah done!* kalau selesai, atau *Males ah* kalau butuh versi lebih gampang\n\n"
+        "Lo juga bisa kirim foto list tugas lo dan narAI bakal bacain dan pilihkan satu buat lo.\n\n"
+        "Gampang kan? Yuk gas! 🔥",
+        parse_mode="Markdown"
+    )
+
+async def handle_stuck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_profile = get_user(chat_id)
+    user_state[chat_id] = CLARIFYING
+    reply = ask_narai_clarify("gue stuck ga tau mau mulai dari mana", user_profile)
+    await update.message.reply_text(reply)
+
+async def handle_overwhelmed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_profile = get_user(chat_id)
+    user_state[chat_id] = CLARIFYING
+    reply = ask_narai_clarify("gue overwhelmed banyak banget kerjaan", user_profile)
+    await update.message.reply_text(reply)
+
+async def handle_energy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_profile = get_user(chat_id)
+    name = user_profile.get("name", "") if user_profile else ""
+    user_state[chat_id] = ACTION_SENT
+    reply = f"Oke{' ' + name if name else ''}, ga apa-apa. Coba buka laptop lo dan liat satu task yang paling gampang. 2 menit aja, itu cukup. Coba deh."
+    user_last_action[chat_id] = reply
+    await update.message.reply_text(reply, reply_markup=action_buttons())
+    await update.message.reply_text(f"Gue bakal check in sama lo sekitar 1 jam lagi ya{' ' + name if name else ''}. Gas! 🔥")
+    start_nudge(context, chat_id, user_profile)
+
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-
     stats = get_stats()
     if not stats:
         await update.message.reply_text("Gagal ngambil stats. Coba lagi ya!")
         return
-
     msg = f"""📊 *narAI Stats*
 
 👥 Total users: {stats['total_users']}
@@ -313,7 +351,6 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ✅ Completed: {stats['total_done']}
 😩 Resisted: {stats['total_resist']}
 📈 Completion rate: {stats['completion_rate']}%"""
-
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -322,7 +359,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     user_profile = get_user(chat_id)
     name = user_profile.get("name", "") if user_profile else ""
-
     stop_nudge(chat_id)
 
     if query.data == "done":
@@ -338,13 +374,11 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_resistance_level[chat_id] = min(level, 2)
         log_session(chat_id, user_last_action.get(chat_id, ""), "resist")
         await query.edit_message_reply_markup(reply_markup=None)
-
         simplified = ask_narai_simplified(
             user_last_action.get(chat_id, "tugas lo"), level, user_profile
         )
         user_last_action[chat_id] = simplified
         user_state[chat_id] = ACTION_SENT
-
         await context.bot.send_message(
             chat_id=chat_id,
             text=simplified,
@@ -356,12 +390,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_message = update.message.text
     current_state = user_state.get(chat_id, None)
-
     stop_nudge(chat_id)
-
     user_profile = get_user(chat_id)
 
-    # --- ONBOARDING FLOW ---
     if user_profile is None and current_state is None:
         user_state[chat_id] = ONBOARDING_NAME
         await update.message.reply_text(
@@ -391,18 +422,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = context.user_data.get("name", "")
         job = context.user_data.get("job", "")
         struggle = user_message.strip()
-
         save_user(chat_id, name, job, struggle)
         user_profile = {"name": name, "job": job, "biggest_struggle": struggle}
         user_state[chat_id] = CLARIFYING
-
         await update.message.reply_text(
             f"Oke *{name}*, sekarang gue udah kenal lo! 🎉\n\nKapanpun lo stuck, overwhelmed, atau ga ada energi — tinggal cerita ke gue. Gue bakal kasih lo satu langkah kecil buat mulai.\n\nSo, sekarang lagi ngerjain apa?",
             parse_mode="Markdown"
         )
         return
 
-    # --- NORMAL FLOW ---
     name = user_profile.get("name", "") if user_profile else ""
 
     if is_done(user_message) and user_state.get(chat_id) == ACTION_SENT:
@@ -445,20 +473,16 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     stop_nudge(chat_id)
     user_profile = get_user(chat_id)
-
     await update.message.reply_text("Bentar ya, gue liat dulu list lo... 👀")
-
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     file_bytes = await file.download_as_bytearray()
     image_base64 = base64.b64encode(file_bytes).decode("utf-8")
-
     reply = ask_narai_from_image(image_base64, user_profile)
     user_last_action[chat_id] = reply
     user_resistance_level[chat_id] = 0
     user_state[chat_id] = ACTION_SENT
     log_session(chat_id, reply, "sent")
-
     name = user_profile.get("name", "") if user_profile else ""
     await update.message.reply_text(reply, reply_markup=action_buttons())
     await update.message.reply_text(f"Gue bakal check in sama lo sekitar 1 jam lagi ya{' ' + name if name else ''}. Gas! 🔥")
@@ -468,38 +492,36 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     stop_nudge(chat_id)
     user_profile = get_user(chat_id)
-
     doc = update.message.document
     if not doc.file_name.lower().endswith(".pdf"):
         await update.message.reply_text("Sekarang gue cuma bisa baca PDF sama gambar ya!")
         return
-
     await update.message.reply_text("Bentar ya, gue baca PDF lo dulu... 📄")
-
     file = await context.bot.get_file(doc.file_id)
     file_bytes = await file.download_as_bytearray()
-
     pdf = fitz.open(stream=bytes(file_bytes), filetype="pdf")
     text = ""
     for page in pdf:
         text += page.get_text()
-
     if not text.strip():
         await update.message.reply_text("Hmm PDF-nya kosong atau ga bisa dibaca. Coba kirim sebagai gambar aja!")
         return
-
     reply = ask_narai_from_list(text[:2000], user_profile)
     user_last_action[chat_id] = reply
     user_resistance_level[chat_id] = 0
     user_state[chat_id] = ACTION_SENT
     log_session(chat_id, reply, "sent")
-
     name = user_profile.get("name", "") if user_profile else ""
     await update.message.reply_text(reply, reply_markup=action_buttons())
     await update.message.reply_text(f"Gue bakal check in sama lo sekitar 1 jam lagi ya{' ' + name if name else ''}. Gas! 🔥")
     start_nudge(context, chat_id, user_profile)
 
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+app.add_handler(CommandHandler("start", handle_start))
+app.add_handler(CommandHandler("help", handle_help))
+app.add_handler(CommandHandler("stuck", handle_stuck_cmd))
+app.add_handler(CommandHandler("overwhelmed", handle_overwhelmed_cmd))
+app.add_handler(CommandHandler("energy", handle_energy_cmd))
 app.add_handler(CommandHandler("stats", handle_stats))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 app.add_handler(MessageHandler(filters.PHOTO, handle_image))
