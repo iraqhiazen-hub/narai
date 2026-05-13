@@ -181,7 +181,7 @@ def ask_narai_action(user_message, user_profile=None):
 Gaya ngobrol kamu:
 - Casual, hangat, kayak teman deket
 - Pakai nama mereka kalau kamu tau
-- Pakai bahasa sehari-hari (lo/gue)
+- WAJIB deteksi bahasa user: kalau user pakai Bahasa Indonesia → balas Bahasa Indonesia sehari-hari. Kalau user pakai English → balas English yang casual. JANGAN campur bahasa.
 - SANGAT pendek — maksimal 2 kalimat
 - Spesifik ke tugas yang mereka sebut, jangan generik
 
